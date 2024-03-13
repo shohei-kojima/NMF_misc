@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 
-import os,sys,glob,gzip
 import numpy as np
 import sklearn.preprocessing as preprocessing
 import sklearn.decomposition as decomposition
@@ -16,7 +15,6 @@ class MVNMF:
         init = 'nndsvd',  # init = {‘random’, ‘nndsvd’, ‘nndsvda’, ‘nndsvdar’}
         lambda_tilde = 1e-5,
         delta = 1.0,
-        gamma = 1.0,
         max_iter = 200,
         min_iter = 100,
         tol = 1e-4,
@@ -29,7 +27,6 @@ class MVNMF:
         self.init = init
         self.lambda_tilde = lambda_tilde
         self.delta = delta
-        self.gamma = gamma
         self.max_iter = max_iter
         self.min_iter = min_iter
         self.tol = tol
@@ -41,62 +38,55 @@ class MVNMF:
         # init = {‘random’, ‘nndsvd’, ‘nndsvda’, ‘nndsvdar’, ‘custom’}
         # https://scikit-learn.org/stable/modules/generated/sklearn.decomposition.NMF.html
         W, H = decomposition._nmf._initialize_nmf(self.X, self.n_components, init = self.init)
-        W = preprocessing.normalize(W, norm = 'l1', axis = 0)
+        W, H = self.normalize_clip_WH(W, H)
         self.W = W
         self.H = H
     
     @staticmethod
-    def normalize_WH(W, H):
+    def normalize_clip_WH(W, H):
+        # W: same as preprocessing.normalize(W, norm = 'l1', axis = 0)
+        #    i.e., projection on simplex
         norm_factor = np.sum(W, axis = 0)
         W = W / norm_factor
         H = H * norm_factor.reshape(-1, 1)
+        # clip small values, EPSILON = np.finfo(np.float32).eps
+        W = W.clip(EPSILON)
+        H = H.clip(EPSILON)
         return W, H
     
-    def kl_divergence_X_WH(self, W, H):
-        A_data = self.X.ravel()
-        B_data = (W @ H).ravel()
-        indices = A_data > 0
-        A_data = A_data[indices]
-        B_data_remaining = B_data[~indices]
-        B_data = B_data[indices]
-        res = np.sum(A_data * np.log(A_data / B_data) - A_data + B_data) + np.sum(B_data_remaining)
-        return res
+    def sklearn_beta_div(self, W, H, beta = 1):
+        return decomposition._nmf._beta_divergence(self.X, W, H, beta)
     
     def volume_log_det(self, W, H):
         K = W.shape[1]
         return np.log10(np.linalg.det(W.T @ W + self.delta * np.eye(K)))
     
-    def loss_mvnmf(self, W, H):
-        reconstruction_error = self.kl_divergence_X_WH(W, H)
+    def calc_loss(self, W, H):
+        beta_div = self.sklearn_beta_div(W, H)
         volume = self.volume_log_det(W, H)
-        loss = reconstruction_error + self.Lambda * volume
-        return loss, reconstruction_error, volume
+        loss = beta_div + self.Lambda * volume
+        return loss, beta_div, volume
     
     def solve(self):
         # reimplementation of https://github.com/parklab/MuSiCal/blob/main/musical/mvnmf.py#L39
+        # preparation
         X = self.X
+        W = self.W  # initialized W
+        H = self.H  # initialized H
         n_features, n_samples = self.X.shape
-        M = n_features
-        T = n_samples
         K = self.n_components
-        # normalize W, H
-        W, H = self.normalize_WH(self.W, self.H)
-        # clip small values, EPSILON = np.finfo(np.float32).eps
-        W = W.clip(EPSILON)
-        H = H.clip(EPSILON)
-        # calculate Lambda from labmda_tilde
-        reconstruction_error = self.kl_divergence_X_WH(W, H)
+        # determine Lambda
+        beta_div = self.sklearn_beta_div(W, H)
         volume = self.volume_log_det(W, H)
-        self.Lambda = self.lambda_tilde * reconstruction_error / np.abs(volume)
-        loss = reconstruction_error + self.Lambda * volume
-        # constants
-        ones = np.ones((M, T))
-        # baseline of convergence test
-        conv_test_baseline = loss
+        self.Lambda = self.lambda_tilde * beta_div / np.abs(volume)
         # main
-        gamma = self.gamma
+        loss = beta_div + self.Lambda * volume
+        conv_test_baseline = loss   # here, the initial loss = baseline
+        ones = np.ones((n_features, n_samples))
+        gamma_max = 1.0  # initial gamma
+        gamma = gamma_max
         losses = [loss]
-        reconstruction_errors = [reconstruction_error]
+        beta_divs = [beta_div]
         volumes = [volume]
         line_search_steps = []
         gammas = [gamma]
@@ -117,32 +107,28 @@ class MVNMF:
             Wup = W * (numerator / denominator)
             Wup = Wup.clip(EPSILON)
             # Backtracking line search for W
-            W_new = (1.0 - gamma) * W + gamma * Wup
-            W_new, H_new = self.normalize_WH(W_new, H)
-            W_new = W_new.clip(EPSILON)
-            H_new = H_new.clip(EPSILON)
-            loss, reconstruction_error, volume = self.loss_mvnmf(W_new, H_new)
+            W_new = (gamma_max - gamma) * W + gamma * Wup
+            W_new, H_new = self.normalize_clip_WH(W_new, H)
+            loss, beta_div, volume = self.calc_loss(W_new, H_new)
             line_search_step = 0
             while (loss > losses[-1]) and (gamma > 1e-16):
                 gamma = gamma * 0.8
-                W_new = (1.0 - gamma) * W + gamma * Wup
-                W_new, H_new = self.normalize_WH(W_new, H)
-                W_new = W_new.clip(EPSILON)
-                H_new = H_new.clip(EPSILON)
-                loss, reconstruction_error, volume = self.loss_mvnmf(W_new, H_new)
+                W_new = (gamma_max - gamma) * W + gamma * Wup
+                W_new, H_new = self.normalize_clip_WH(W_new, H)
+                loss, beta_div, volume = self.calc_loss(W_new, H_new)
                 line_search_step += 1
             W = W_new
             H = H_new
             line_search_steps.append(line_search_step)
             # update gamma
-            gamma = min(gamma * 2.0, self.gamma)
+            gamma = min(gamma * 2.0, gamma_max)
             gammas.append(gamma)
             # loss
-            loss, reconstruction_error, volume = self.loss_mvnmf(W, H)
+            loss, beta_div, volume = self.calc_loss(W, H)
             losses.append(loss)
-            reconstruction_errors.append(reconstruction_error)
+            beta_divs.append(beta_div)
             volumes.append(volume)
-            # convergence test
+            # check convergence
             if n_iter >= self.min_iter and n_iter % self.conv_test_freq == 0:
                 relative_loss_change = (losses[-2] - loss) / conv_test_baseline
                 if (loss <= losses[-2]) and (relative_loss_change <= self.tol):
@@ -153,7 +139,7 @@ class MVNMF:
             if converged and n_iter >= self.min_iter:
                 break
         self.losses = np.array(losses)
-        self.reconstruction_errors = np.array(reconstruction_errors)
+        self.beta_divs = np.array(beta_divs)
         self.volumes = np.array(volumes)
         self.line_search_steps = np.array(line_search_steps)
         self.gammas = np.array(gammas)
